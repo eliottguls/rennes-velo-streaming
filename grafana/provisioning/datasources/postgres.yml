@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: Velo Postgres
+    uid: velo-pg
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    user: grafana_ro
+    isDefault: true
+    secureJsonData:
+      password: grafana_ro
+    jsonData:
+      database: velo
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false

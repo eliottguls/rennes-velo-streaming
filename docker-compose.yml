@@ -1,0 +1,148 @@
+name: velo-rennes
+
+x-flink-env: &flink-env
+  FLINK_PROPERTIES: |
+    jobmanager.rpc.address: jobmanager
+    rest.address: jobmanager
+    taskmanager.numberOfTaskSlots: 4
+    parallelism.default: 1
+    jobmanager.memory.process.size: 1024m
+    taskmanager.memory.process.size: 1536m
+    state.backend.type: hashmap
+    state.checkpoints.dir: file:///flink-data/checkpoints
+    restart-strategy.type: exponential-delay
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --mode dev-container
+      - --smp 1
+      - --memory 768M
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # Faux flux STAR (vélos + bus) pour développer hors ligne : docker compose --profile mock up
+  mock-star:
+    build: ./mock-star
+    profiles: ["mock"]
+    restart: unless-stopped
+
+  velo-producer:
+    build: ./producer
+    image: velo-rennes-producer
+    environment:
+      GBFS_URL: ${GBFS_URL:-https://eu.ftp.opendatasoft.com/star/gbfs/gbfs.json}
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+    depends_on:
+      redpanda: { condition: service_healthy }
+    restart: unless-stopped
+
+  bus-producer:
+    image: velo-rennes-producer
+    command: ["python", "-u", "bus_producer.py"]
+    environment:
+      GTFSRT_VEHICLE_POSITIONS_URL: ${GTFSRT_VEHICLE_POSITIONS_URL:-https://proxy.transport.data.gouv.fr/resource/star-rennes-integration-gtfs-rt-vehicle-position}
+      GTFS_STATIC_URL: ${GTFS_STATIC_URL:-https://eu.ftp.opendatasoft.com/star/gtfs/GTFS_STAR_BUS_METRO_EN_COURS.zip}
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      BUS_POLL_SECONDS: ${BUS_POLL_SECONDS:-5}
+    depends_on:
+      redpanda: { condition: service_healthy }
+      velo-producer: { condition: service_started }
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: velo
+      POSTGRES_USER: ${POSTGRES_USER:-velo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-velo}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d velo"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  jobmanager:
+    build: ./flink
+    image: velo-rennes-flink
+    command: jobmanager
+    environment: *flink-env
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - flink-data:/flink-data
+    restart: unless-stopped
+
+  taskmanager:
+    image: velo-rennes-flink
+    command: taskmanager
+    environment: *flink-env
+    volumes:
+      - flink-data:/flink-data
+    depends_on: [jobmanager]
+    restart: unless-stopped
+
+  flink-submit:
+    image: velo-rennes-flink
+    command: ["/opt/submit.sh"]
+    environment:
+      <<: *flink-env
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/velo
+      POSTGRES_USER: ${POSTGRES_USER:-velo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-velo}
+    depends_on:
+      jobmanager: { condition: service_started }
+      taskmanager: { condition: service_started }
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: on-failure:5
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/rennes-live.json
+      GF_USERS_DEFAULT_THEME: dark
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  console:
+    image: redpandadata/console:v2.7.2
+    profiles: ["debug"]
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on: [redpanda]
+
+volumes:
+  redpanda-data:
+  pg-data:
+  flink-data:
+  grafana-data:
